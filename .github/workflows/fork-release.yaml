@@ -1,0 +1,51 @@
+# Publishes maestro.zip for a cli-<upstream version>-android-user.<n> tag.
+name: Fork release
+
+on:
+  push:
+    tags: ['cli-*-android-user.*']
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing cli-<version>-android-user.<n> tag to (re)publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Test
+        run: ./gradlew test --no-daemon
+      - name: Build CLI distribution
+        run: ./gradlew :maestro-cli:distZip --no-daemon
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base=$(tr -d '[:space:]' < .fork/upstream-tag)
+          cd maestro-cli/build/distributions
+          sha256sum maestro.zip > maestro.zip.sha256
+          gh release create "$TAG" maestro.zip maestro.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes "Unofficial build of Maestro: upstream $base plus \`maestro test --android-user\`. Not the official Maestro. See [FORK.md](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/FORK.md)."
