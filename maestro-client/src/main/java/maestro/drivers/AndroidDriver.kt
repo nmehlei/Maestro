@@ -35,6 +35,7 @@ import maestro.MaestroDriverStartupException.AndroidInstrumentationSetupFailure
 import maestro.UiElement.Companion.toUiElementOrNull
 import maestro.android.AdbSocketFactory
 import maestro.android.AndroidAppFiles
+import maestro.android.AndroidUserCommands
 import maestro.android.AndroidLaunchArguments.toAndroidLaunchArguments
 import maestro.android.chromedevtools.AndroidWebViewHierarchyClient
 import maestro.device.DeviceOrientation
@@ -70,6 +71,7 @@ class AndroidDriver(
     private var emulatorName: String = "",
     private val reinstallDriver: Boolean = true,
     private val metricsProvider: Metrics = MetricsProvider.getInstance(),
+    private val androidUser: Int? = null,
     ) : Driver {
     private var open = false
     private val hostPort: Int = hostPort ?: DefaultDriverHostPort
@@ -218,8 +220,13 @@ class AndroidDriver(
             if(!open) // pick device flow, no open() invocation
                 open()
 
-            if (!isPackageInstalled(appId)) {
+            if (!isPackageInstalled(appId, androidUser ?: 0)) {
                 throw IllegalArgumentException("Package $appId is not installed")
+            }
+
+            if (androidUser != null) {
+                launchAppAsUser(appId, launchArguments, androidUser)
+                return@measured
             }
 
             val arguments = launchArguments.toAndroidLaunchArguments()
@@ -234,27 +241,56 @@ class AndroidDriver(
         }
     }
 
+    // The on-device driver runs in the primary user and cannot start activities in another one,
+    // so launch from the shell, which can. Mirrors getLaunchIntentForPackage + startActivity.
+    private fun launchAppAsUser(appId: String, launchArguments: Map<String, Any>, user: Int) {
+        val component = AndroidUserCommands.parseLauncherComponent(
+            shell(AndroidUserCommands.queryLauncherActivitiesCommand(user, appId)),
+            appId,
+        ) ?: throw IllegalStateException("No launcher activity found for package $appId in user $user")
+
+        // The command carries the launch arguments, which may be secrets: never chain or log it.
+        val command = AndroidUserCommands.amStartCommand(user, component, launchArguments)
+        val output = try {
+            shell(command)
+        } catch (e: IOException) {
+            // Never silently change an argument's type; the flow author has to decide.
+            if (AndroidUserCommands.isMissingDoubleExtraSupport(e.message)) {
+                throw IllegalArgumentException(
+                    "This device's Android version cannot pass Double launch arguments to an app in user $user. " +
+                        "Pass the value as a String instead."
+                )
+            }
+            throw IOException(AndroidUserCommands.launchFailureMessage(appId, user, command, e.message))
+        }
+        if (output.contains("Error:")) {
+            throw IllegalStateException("Maestro failed to launch app $appId in user $user: ${output.trim()}")
+        }
+    }
+
+    private val userFlag: String get() = AndroidUserCommands.userFlag(androidUser)
+
     override fun stopApp(appId: String) {
         metrics.measured("operation", mapOf("command" to "stopApp", "appId" to appId)) {
             // Note: If the package does not exist, this call does *not* throw an exception
-            shell("am force-stop $appId")
+            shell("am force-stop $userFlag$appId")
         }
     }
 
     override fun killApp(appId: String) {
         metrics.measured("operation", mapOf("command" to "killApp", "appId" to appId)) {
             // Kill is the adb command needed to trigger System-initiated Process Death
-            shell("am kill $appId")
+            shell("am kill $userFlag$appId")
         }
     }
 
     override fun clearAppState(appId: String) {
         metrics.measured("operation", mapOf("command" to "clearAppState", "appId" to appId)) {
-            if (!isPackageInstalled(appId)) {
+            if (!isPackageInstalled(appId, androidUser ?: 0)) {
                 return@measured
             }
 
-            shell("pm clear $appId")
+            shell("pm clear $userFlag$appId")
         }
     }
 
@@ -577,7 +613,7 @@ class AndroidDriver(
             if (browser) {
                 openBrowser(link)
             } else {
-                dadb.shell("am start -a android.intent.action.VIEW -d \"$link\"")
+                dadb.shell("am start ${userFlag}-a android.intent.action.VIEW -d \"$link\"")
             }
 
             if (autoVerify) {
@@ -595,7 +631,7 @@ class AndroidDriver(
 
     private fun autoVerifyWithAppName(appId: String) {
         val appNameResult = runCatching {
-            val apkFile = AndroidAppFiles.getApkFile(dadb, appId)
+            val apkFile = AndroidAppFiles.getApkFile(dadb, appId, androidUser ?: 0)
             val appName = ApkFile(apkFile).apkMeta.name
             apkFile.delete()
             appName
@@ -642,20 +678,20 @@ class AndroidDriver(
         val installedPackages = installedPackages()
         when {
             installedPackages.contains("com.android.chrome") -> {
-                dadb.shell("am start -a android.intent.action.VIEW -d \"$link\" com.android.chrome")
+                dadb.shell("am start ${userFlag}-a android.intent.action.VIEW -d \"$link\" com.android.chrome")
             }
 
             installedPackages.contains("org.mozilla.firefox") -> {
-                dadb.shell("am start -a android.intent.action.VIEW -d \"$link\" org.mozilla.firefox")
+                dadb.shell("am start ${userFlag}-a android.intent.action.VIEW -d \"$link\" org.mozilla.firefox")
             }
 
             else -> {
-                dadb.shell("am start -a android.intent.action.VIEW -d \"$link\"")
+                dadb.shell("am start ${userFlag}-a android.intent.action.VIEW -d \"$link\"")
             }
         }
     }
 
-    private fun installedPackages() = shell("pm list packages").split("\n")
+    private fun installedPackages() = shell("pm list packages $userFlag".trimEnd()).split("\n")
         .map { line: String -> line.split(":".toRegex()).toTypedArray() }
         .filter { parts: Array<String> -> parts.size == 2 }
         .map { parts: Array<String> -> parts[1] }
@@ -905,7 +941,7 @@ class AndroidDriver(
 
     private fun setAllPermissions(appId: String, permissionValue: String) {
         val permissionsResult = runCatching {
-            val apkFile = AndroidAppFiles.getApkFile(dadb, appId)
+            val apkFile = AndroidAppFiles.getApkFile(dadb, appId, androidUser ?: 0)
             val permissions = ApkFile(apkFile).apkMeta.usesPermissions
             apkFile.delete()
             permissions
@@ -928,7 +964,7 @@ class AndroidDriver(
             if (permission in appOpsPermissions) {
                 setAppOp(appId, permission, rawValue)
             } else {
-                shell("pm ${translatePermissionValue(rawValue)} $appId $permission")
+                shell("pm ${translatePermissionValue(rawValue)} $userFlag$appId $permission")
             }
         } catch (exception: Exception) {
             // Ignore if it's something that the user doesn't have control over (e.g. you can't grant / deny INTERNET)
@@ -951,7 +987,7 @@ class AndroidDriver(
             else -> "default" // "unset" resets to system default
         }
 
-        shell("appops set --uid $appId $opName $appOpsValue")
+        shell("appops set $userFlag--uid $appId $opName $appOpsValue")
     }
 
     private fun translatePermissionName(name: String): List<String> {
@@ -1226,9 +1262,10 @@ class AndroidDriver(
         }
     }
 
-    private fun isPackageInstalled(packageName: String): Boolean {
+    // Maestro's own driver apps live in the primary user; only the app under test uses androidUser.
+    private fun isPackageInstalled(packageName: String, user: Int = 0): Boolean {
         try {
-            val output: String = shell("pm list packages --user 0 $packageName")
+            val output: String = shell("pm list packages --user $user $packageName")
             return output.split("\n".toRegex())
                 .map { line -> line.split(":".toRegex()) }
                 .filter { parts -> parts.size == 2 }
