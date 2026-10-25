@@ -1,0 +1,134 @@
+# Follows upstream Maestro releases.
+# Rebases this fork's commits onto each new upstream release tag, tests, and releases.
+# If anything fails, opens an issue (once per title) and publishes nothing new.
+#
+# Pushing rebased commits that touch .github/workflows needs a token with the "workflows"
+# permission, which GITHUB_TOKEN never has: store a fine-grained personal access token with
+# Contents and Workflows read/write on this repository as the secret UPSTREAM_SYNC_TOKEN.
+name: Fork upstream sync
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      tag: ${{ steps.publish.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: android-user
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+      - name: Find newest upstream release
+        id: find
+        run: |
+          latest=$(git ls-remote --tags --refs https://github.com/mobile-dev-inc/Maestro.git 'cli-*' \
+            | sed 's#.*refs/tags/##' | grep -E '^cli-[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          current=$(tr -d '[:space:]' < .fork/upstream-tag)
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "upstream: $latest, fork based on: $current"
+      - name: Rebase onto the new release
+        id: rebase
+        if: steps.find.outputs.latest != steps.find.outputs.current
+        env:
+          LATEST: ${{ steps.find.outputs.latest }}
+          CURRENT: ${{ steps.find.outputs.current }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --quiet https://github.com/mobile-dev-inc/Maestro.git \
+            "refs/tags/$LATEST:refs/tags/$LATEST" "refs/tags/$CURRENT:refs/tags/$CURRENT"
+          echo "before=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          set +e
+          .fork/rebase-onto.sh "$LATEST"
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-java@v4
+        if: steps.rebase.outputs.rc == '0'
+        with:
+          distribution: zulu
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.rebase.outputs.rc == '0'
+      - name: Test
+        id: test
+        if: steps.rebase.outputs.rc == '0'
+        continue-on-error: true
+        run: ./gradlew test --no-daemon
+      - name: Publish branch and tag
+        id: publish
+        if: steps.rebase.outputs.rc == '0' && steps.test.outcome == 'success'
+        continue-on-error: true
+        env:
+          LATEST: ${{ steps.find.outputs.latest }}
+          BEFORE: ${{ steps.rebase.outputs.before }}
+        run: |
+          tag="$LATEST-android-user.1"
+          git tag "$tag"
+          # Atomic: branch and tag land together or not at all, so a failed push is retried next run.
+          git push --atomic --force-with-lease="android-user:$BEFORE" origin HEAD:android-user "refs/tags/$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Report a failed upgrade
+        if: (steps.rebase.outputs.rc != '' && steps.rebase.outputs.rc != '0' && steps.rebase.outputs.rc != '3') || steps.test.outcome == 'failure' || steps.publish.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.find.outputs.latest }}
+          RC: ${{ steps.rebase.outputs.rc }}
+          TEST: ${{ steps.test.outcome }}
+          HAS_PUSH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
+        run: |
+          if [ "$RC" = "2" ]; then
+            title="Patch does not apply to $LATEST"; detail="Rebase locally with \`.fork/rebase-onto.sh $LATEST\`, resolve, test and push."
+          elif [ "$TEST" = "failure" ]; then
+            title="Tests fail on $LATEST"; detail="Rebase locally with \`.fork/rebase-onto.sh $LATEST\`, fix, test and push."
+          else
+            title="Publishing $LATEST failed"; detail="The rebase and tests passed but pushing the branch and tag failed. UPSTREAM_SYNC_TOKEN set: $HAS_PUSH_TOKEN (pushing workflow changes needs it)."
+          fi
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json title --jq ".[] | select(.title == \"$title\") | .title")
+          if [ -z "$existing" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --body "The scheduled upgrade to upstream $LATEST stopped: $title. Nothing new was published. $detail Run log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
+          exit 1
+
+  release:
+    needs: upgrade
+    if: needs.upgrade.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/fork-release.yaml
+    with:
+      tag: ${{ needs.upgrade.outputs.tag }}
+
+  report-release:
+    needs: [upgrade, release]
+    if: always() && needs.release.result == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Report a failed release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.upgrade.outputs.tag }}
+        run: |
+          title="Release of $TAG failed"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json title --jq ".[] | select(.title == \"$title\") | .title")
+          if [ -z "$existing" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --body "Branch and tag $TAG were pushed, but publishing the release failed. Retry with the Fork release workflow (Run workflow, tag $TAG). Run log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
+          exit 1

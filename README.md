@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **This is an unofficial fork of [Maestro](https://github.com/mobile-dev-inc/Maestro), not the official Maestro.** It adds one option, `maestro test --android-user <id>`, which runs app-targeting Android commands against that Android user (e.g. a work profile). Without the option it behaves exactly like upstream. See [FORK.md](FORK.md).
+
 > [!TIP]
 > Great things happen when testers connect — [Join the Maestro Community](https://maestrodev.typeform.com/to/FelIEe8A)
 
